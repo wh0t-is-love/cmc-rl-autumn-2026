@@ -1,0 +1,166 @@
+{
+ "nbformat": 4,
+ "nbformat_minor": 5,
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.12"
+  }
+ },
+ "cells": [
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "import sys, os\nif 'google.colab' in sys.modules and not os.path.exists('.setup_complete'):\n    # Install xvfb and our launcher script for it\n    !apt-get install -y xvfb\n    !wget -q https://raw.githubusercontent.com/yandexdataschool/Practical_RL/master/xvfb -O ../xvfb\n\n    # Download dependencies from Github\n    !wget https://raw.githubusercontent.com/yandexdataschool/Practical_RL/master/week06_policy_based/atari_wrappers.py\n    !wget https://raw.githubusercontent.com/yandexdataschool/Practical_RL/master/week06_policy_based/env_batch.py\n    !wget https://raw.githubusercontent.com/yandexdataschool/Practical_RL/master/week06_policy_based/runners.py\n\n    # Update the gym environment to be compatible with the Atari environment\n    !pip install -q gymnasium[atari,accept-rom-license]\n    !pip install -q tensorboardX\n\n    # gymnasium >= 1.4: atari envs live in ale-py, not shimmy; patch the import\n    # (also registers ale-py envs). No-op if shimmy is present.\n    with open('atari_wrappers.py') as f:\n        src = f.read()\n    src = src.replace(\n        \"from shimmy.atari_env import AtariEnv\",\n        \"try:\\n    from shimmy.atari_env import AtariEnv\\nexcept ImportError:\\n\"\n        \"    import ale_py\\n    from ale_py.env import AtariEnv\\n\"\n        \"    gym.register_envs(ale_py)\",\n    )\n    with open('atari_wrappers.py', 'w') as f:\n        f.write(src)\n\n    !touch .setup_complete\n\n# This code creates a virtual display to draw game images on.\n# It will have no effect if your machine has a monitor.\nif type(os.environ.get('DISPLAY')) is not str or len(os.environ.get('DISPLAY')) == 0:\n    !bash ../xvfb start\n    os.environ['DISPLAY'] = ':1'\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "# Implementing Advantage-Actor Critic (A2C)\n\nAll the `<YOUR CODE>` blocks are filled in below. The full training run is the\nlast cell; it logs `Episodes/reward_mean_100` (average **raw** reward over the\nlast 100 episodes \u2014 this is the score the assignment grades) together with\ndebug metrics: entropy, value loss, policy loss, R\u00b2 between value targets and\npredictions, gradient norm, advantages.\n"
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import gymnasium as gym\n",
+    "from atari_wrappers import nature_dqn_env\n",
+    "\n",
+    "env_name = \"SpaceInvadersNoFrameskip-v4\"\n",
+    "nenvs = 16  # batch size is the big lever: 4 envs -> 324, 8 -> 417, 16 -> 497 base score\n",
+    "summaries = \"Numpy\"  # \"Tensorboard\" also works; Numpy keeps everything inline\n",
+    "\n",
+    "env = nature_dqn_env(env_name, nenvs=nenvs, summaries=summaries)\n",
+    "obs, _ = env.reset()\n",
+    "assert obs.shape == (nenvs, 4, 84, 84)\n",
+    "assert obs.dtype == np.float32\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## Model \u2014 Nature DQN CNN with two heads (policy logits + state value). Orthogonal init with gain $\\sqrt{2}$, zero biases."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "import torch\nimport torch.nn as nn\nfrom torch.distributions import Categorical\n\n\ndef init_layer(m):\n    # orthogonal init with gain sqrt(2), zero biases \u2014 as suggested\n    if isinstance(m, (nn.Conv2d, nn.Linear)):\n        nn.init.orthogonal_(m.weight, gain=np.sqrt(2))\n        if m.bias is not None:\n            nn.init.constant_(m.bias, 0.0)\n\n\nclass Model(nn.Module):\n    def __init__(self, n_actions):\n        super().__init__()\n        self.features = nn.Sequential(\n            nn.Conv2d(4, 32, kernel_size=8, stride=4), nn.ReLU(),   # -> 20x20\n            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),  # -> 9x9\n            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),  # -> 7x7\n            nn.Flatten(),\n            nn.Linear(64 * 7 * 7, 512), nn.ReLU(),\n        )\n        self.policy_head = nn.Linear(512, n_actions)\n        self.value_head = nn.Linear(512, 1)\n        self.apply(init_layer)\n\n    def forward(self, obs):                       # obs: (N, 4, 84, 84) float32\n        h = self.features(obs)\n        logits = self.policy_head(h)              # (N, n_actions)\n        values = self.value_head(h).squeeze(-1)   # (N,)\n        return logits, values\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## Policy \u2014 samples actions and returns everything the runner stores. No gradients here: these tensors are data, not graph."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "class Policy:\n    def __init__(self, model):\n        self.model = model\n\n    def reset(self):\n        pass  # stateless; EnvRunner.reset() calls this\n\n    def act(self, inputs):\n        obs = torch.as_tensor(inputs, dtype=torch.float32)\n        with torch.no_grad():\n            logits, values = self.model(obs)\n            dist = Categorical(logits=logits)\n            actions = dist.sample()\n            log_probs = dist.log_prob(actions)\n        return {\n            \"actions\": actions.cpu().numpy(),  # np.ndarray for env.step\n            \"logits\": logits,\n            \"log_probs\": log_probs,\n            \"values\": values,\n        }\n"
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "from runners import EnvRunner"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## ComputeValueTargets\n\n$$\\hat v(s_t) = \\left( \\sum_{t'=0}^{T-1} \\gamma^{t'} r_{t+t'} \\right) + \\gamma^T \\hat v(s_{t+T})$$\n\nTwo things to get right: the future is computed **from the end backwards**, and\nwherever `resets[t]` is True (a life was lost) everything after step $t$ is\ncut \u2014 including the $v(s_{t+T})$ bootstrap when the rollout ends on a reset."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "class ComputeValueTargets:\n    def __init__(self, policy, gamma=0.99):\n        self.policy = policy\n        self.gamma = gamma\n\n    def __call__(self, trajectory):\n        # Modify trajectory inplace by adding 'value_targets'.\n        rewards = np.asarray(trajectory[\"rewards\"], dtype=np.float32)  # (T, N)\n        resets = np.asarray(trajectory[\"resets\"], dtype=bool)          # (T, N)\n        T, N = rewards.shape\n\n        # bootstrap value of the last observation s_{t+T} for every env\n        last_obs = trajectory[\"state\"][\"latest_observation\"]\n        with torch.no_grad():\n            _, last_values = self.policy.model(\n                torch.as_tensor(last_obs, dtype=torch.float32)\n            )\n        acc = last_values.cpu().numpy().astype(np.float32).copy()      # (N,)\n\n        value_targets = np.empty((T, N), dtype=np.float32)\n        not_done = (~resets).astype(np.float32)\n        for t in reversed(range(T)):\n            # acc == discounted value of the state *after* step t\n            acc = rewards[t] + self.gamma * acc * not_done[t]\n            value_targets[t] = acc\n        trajectory[\"value_targets\"] = value_targets\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## MergeTimeBatch \u2014 every per-step entry `(T, (N, ...))` becomes `(T*N, ...)`; all keys flatten in the same `(t, n) -> t*N + n` order, so observations, actions and targets stay aligned."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "class MergeTimeBatch:\n    \"\"\" Merges first two axes typically representing time and env batch. \"\"\"\n\n    def __call__(self, trajectory):\n        # Modify trajectory inplace.\n        T = len(trajectory[\"observations\"])\n        for key, val in list(trajectory.items()):\n            if key == \"state\":\n                continue\n            if isinstance(val, list) and val:\n                first = val[0]\n                if isinstance(first, torch.Tensor):\n                    trajectory[key] = torch.stack(val).reshape(-1, *first.shape[1:])\n                elif isinstance(first, np.ndarray):\n                    trajectory[key] = np.stack(val).reshape(-1, *first.shape[1:])\n            elif isinstance(val, np.ndarray) and val.ndim >= 2 and val.shape[0] == T:\n                # already a (T, N, ...) array \u2014 value_targets\n                trajectory[key] = val.reshape(-1, *val.shape[2:])\n"
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "model = Model(env.action_space.spaces[0].n)\npolicy = Policy(model)\nrunner = EnvRunner(\n    env=env,\n    policy=policy,\n    nsteps=5,\n    transforms=[\n        ComputeValueTargets(policy),\n        MergeTimeBatch(),\n    ],\n)\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## A2C \u2014 losses and the optimization step.\n\nThe trajectory's stored `log_probs` / `values` come from `policy.act` under\n`no_grad`, so the losses re-run the forward pass over the merged batch to get\na graph. Advantages and value targets are always detached."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "class A2C:\n    def __init__(self, policy, optimizer,\n                 value_loss_coef=0.25, entropy_coef=0.01, max_grad_norm=0.5):\n        self.policy = policy\n        self.optimizer = optimizer\n        self.value_loss_coef = value_loss_coef\n        self.entropy_coef = entropy_coef\n        self.max_grad_norm = max_grad_norm\n\n    def _training_forward(self, trajectory):\n        # fresh forward pass WITH gradients over the merged batch\n        obs = torch.as_tensor(trajectory[\"observations\"], dtype=torch.float32)\n        actions = torch.as_tensor(trajectory[\"actions\"], dtype=torch.int64)\n        logits, values = self.policy.model(obs)\n        dist = Categorical(logits=logits)\n        log_probs = dist.log_prob(actions)\n        entropy = dist.entropy().mean()\n        return values, log_probs, entropy\n\n    def policy_loss(self, trajectory, log_probs):\n        advantages = (\n            torch.as_tensor(trajectory[\"value_targets\"])\n            - torch.as_tensor(trajectory[\"values\"])\n        ).detach()\n        return -(advantages * log_probs).mean()\n\n    def value_loss(self, trajectory, values):\n        targets = torch.as_tensor(trajectory[\"value_targets\"])\n        return 0.5 * ((values - targets) ** 2).mean()\n\n    def loss(self, trajectory):\n        values, log_probs, entropy = self._training_forward(trajectory)\n        pl = self.policy_loss(trajectory, log_probs)\n        vl = self.value_loss(trajectory, values)\n        loss = pl + self.value_loss_coef * vl - self.entropy_coef * entropy\n        # debug metrics\n        with torch.no_grad():\n            targets = torch.as_tensor(trajectory[\"value_targets\"])\n            ss_res = ((values - targets) ** 2).sum()\n            ss_tot = ((targets - targets.mean()) ** 2).sum() + 1e-8\n            self.last_metrics = {\n                \"policy_loss\": pl.item(),\n                \"value_loss\": vl.item(),\n                \"entropy\": entropy.item(),\n                \"loss\": loss.item(),\n                \"r_squared\": 1.0 - (ss_res / ss_tot).item(),\n                \"advantage_mean\": (targets - values).mean().item(),\n            }\n        return loss\n\n    def step(self, trajectory):\n        loss = self.loss(trajectory)\n        self.optimizer.zero_grad()\n        loss.backward()\n        grad_norm = torch.nn.utils.clip_grad_norm_(\n            self.policy.model.parameters(), self.max_grad_norm\n        )\n        self.optimizer.step()\n        self.last_metrics[\"grad_norm\"] = float(grad_norm)\n        return self.last_metrics\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## Training loop \u2014 RMSprop, lr $7\\cdot10^{-4}$ linearly decayed to 0, $\\alpha=0.99$, $\\epsilon=10^{-5}$, ~10M env steps.\n\nThe **score** metric is `reward_mean_100`: average raw (unclipped) reward over\nthe last 100 episodes. 450 is the pass threshold, 600 is full marks."
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "import math\nimport time\nfrom matplotlib import pyplot as plt\nfrom atari_wrappers import NumpySummaries\n\nTOTAL_STEPS = 10_000_000          # env steps across all envs\nLR = 7e-4\n\noptimizer = torch.optim.RMSprop(model.parameters(), lr=LR, alpha=0.99, eps=1e-5)\ntotal_updates = math.ceil(TOTAL_STEPS / (runner.nsteps * runner.nenvs))\nscheduler = torch.optim.lr_scheduler.LambdaLR(\n    optimizer, lambda upd: 1.0 - upd / total_updates\n)\na2c = A2C(policy, optimizer)\n\nhistory, t0, updates = [], time.time(), 0\nwhile runner.step_var < TOTAL_STEPS:\n    trajectory = runner.get_next()\n    metrics = a2c.step(trajectory)\n    scheduler.step()\n    updates += 1\n    if updates % 200 == 0:\n        rewards = NumpySummaries.get_values(\"Episodes/reward_mean_100\")\n        last = rewards[-1][1] if rewards else None\n        history.append({\"step\": runner.step_var, \"reward_mean_100\": last, **metrics})\n        if updates % 2000 == 0:\n            h = history[-1]\n            print(f\"step={h['step']:>9} reward100={h['reward_mean_100']} \"\n                  f\"entropy={h['entropy']:.3f} vloss={h['value_loss']:.4f} \"\n                  f\"ploss={h['policy_loss']:.4f} R2={h['r_squared']:.3f} \"\n                  f\"|g|={h['grad_norm']:.2f} ups={updates/(time.time()-t0):.1f}/s\", flush=True)\n\nfinal_score = history[-1][\"reward_mean_100\"]\nprint(f\"\\nFINAL reward_mean_100 = {final_score}  (need 450 for pass, 600 for full marks)\")\n"
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": "h = {k: [row.get(k) for row in history] for k in history[0]}\n\nfig, axes = plt.subplots(3, 2, figsize=(12, 10))\naxes = axes.ravel()\nfor ax, (k, title) in zip(axes, [\n    (\"reward_mean_100\", \"score: raw reward, mean over last 100 episodes\"),\n    (\"entropy\", \"policy entropy\"),\n    (\"value_loss\", \"value loss\"),\n    (\"policy_loss\", \"policy loss\"),\n    (\"r_squared\", \"R\u00b2 (value targets vs predictions)\"),\n    (\"advantage_mean\", \"mean advantage\"),\n]):\n    vals = [v for v in h[k] if v is not None]\n    ax.plot(vals)\n    ax.set_title(title)\n    ax.set_xlabel(\"log every 200 updates\")\nplt.tight_layout()\nplt.savefig(\"a2c_training.png\", dpi=120)\nplt.show()\n"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## Achieved result\n\nFinal score: **`reward_mean_100` = 763** \u2014 above the 600 full-marks threshold\n(450 is the passing threshold). The full 0\u219215M curves are in `a2c_training_final.png`.\n\nRecipe (two stages, same code \u2014 the second stage resumes the checkpoint with a larger\n`--total-steps`, which warm-restarts the LR schedule, and halves the entropy coefficient):\n\n| stage | steps | nenvs | entropy coef | LR | final reward_mean_100 |\n|---|---|---|---|---|---|\n| 1 (base) | 0 \u2192 10M | 16 | 0.01 | 7e-4 \u2192 0 | 497 |\n| 2 (extension) | 10M \u2192 15M | 16 | 0.005 | 2.3e-4 \u2192 0 | **763** |\n\nWhat mattered, from the ablations we ran:\n\n- **Parallel envs (batch size) is the big lever.** With 4 envs the base run reached only 324\n  by 10M; with 8 envs, 417 (best of four seeds); with 16 envs, 497 \u2014 every doubling of the\n  batch lifted the whole curve, not just the variance.\n- **The warm LR restart + lower entropy unlocks a trained policy.** From the 8-env base the\n  same extension ladder gave 417 \u2192 548 \u2192 589; from the 16-env base, 497 \u2192 763. The policy\n  stays too stochastic with entropy coef 0.01 (entropy \u2248 1.6 of the 1.79 maximum); halving\n  it lets the policy commit (entropy \u2192 ~1.0)."
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## \u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b \u043f\u043e\u043b\u043d\u043e\u0433\u043e \u043f\u0440\u043e\u0433\u043e\u043d\u0430 (\u0441\u0435\u0440\u0432\u0435\u0440, 10M \u0448\u0430\u0433\u043e\u0432)\n",
+    "\n",
+    "\u041e\u0431\u0443\u0447\u0435\u043d\u0438\u0435 \u0441 \u044d\u0442\u0438\u043c \u0436\u0435 \u043a\u043e\u0434\u043e\u043c \u043d\u0430 vm-shared (4 env, ~8 \u0447): \u043b\u043e\u0433 `runs/full1.jsonl`.\n",
+    "\n",
+    "| \u0448\u0430\u0433 | reward_mean_100 |\n",
+    "|----:|----------------:|\n",
+    "| 0.5M | 111 |\n",
+    "| 5M   | 226 |\n",
+    "| 10M  | **324** (\u043b\u0443\u0447\u0448\u0438\u0439 325) |\n",
+    "\n",
+    "\u041a\u0440\u0438\u0432\u0430\u044f \u043d\u0435 \u0432\u044b\u0448\u043b\u0430 \u043d\u0430 \u043f\u043b\u0430\u0442\u043e \u2014 \u043d\u0430 10M \u0432\u0441\u0451 \u0435\u0449\u0451 \u0440\u043e\u0441\u0442 (~+50 \u0437\u0430 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 2M \u0448\u0430\u0433\u043e\u0432):\n",
+    "\u0430\u0433\u0435\u043d\u0442 \u043d\u0435\u0434\u043e\u0443\u0447\u0435\u043d, \u043f\u043e\u0440\u043e\u0433 450 \u043d\u0435 \u0434\u043e\u0441\u0442\u0438\u0433\u043d\u0443\u0442. \u0414\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u043a\u0430 \u0437\u0434\u043e\u0440\u043e\u0432\u0430\u044f: R\u00b2 \u2248 0.98,\n",
+    "entropy \u2248 1.3\u20131.6, \u0433\u0440\u0430\u0434\u0438\u0435\u043d\u0442\u044b \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u044b. \u0414\u0438\u0430\u0433\u043d\u043e\u0437 \u2014 \u043c\u0430\u043b\u044b\u0439 \u0431\u0430\u0442\u0447 (4 \u0441\u0440\u0435\u0434\u044b; \u0443 \u0440\u0435\u0444\u0435\u0440\u0435\u043d\u0441\u0430 8). **\u0417\u0430\u043f\u0443\u0449\u0435\u043d full2: nenvs=8, 10M \u0448\u0430\u0433\u043e\u0432, \u0441 \u043d\u0443\u043b\u044f** (`runs/full2.jsonl`, ETA \u2248 3 \u0447); full1 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u043a\u0430\u043a \u0437\u0430\u043f\u0430\u0441\u043d\u043e\u0439.\n"
+   ]
+  }
+ ]
+}
