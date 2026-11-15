@@ -3,13 +3,13 @@
 Runs the policy in fresh environments (raw rewards, no clipping) and prints
 per-episode scores — both with sampled actions (as during training) and argmax.
 """
+import os
 import sys
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/wil/labs/rl_hw")
-sys.path.insert(0, "/home/wil/labs/rl_hw/src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atari_wrappers import nature_dqn_env  # noqa: E402
 from solution import Model  # noqa: E402

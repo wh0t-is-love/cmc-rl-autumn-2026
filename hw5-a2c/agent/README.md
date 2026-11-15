@@ -31,7 +31,7 @@
 1. **Размер батча — главный рычаг**: каждое удвоение числа сред (4→8→16) поднимало всю кривую, а не только разброс (324→417→497 базы).
 2. **Тёплый LR-рестарт + снижение entropy вдвое раскрывают обученную политику**: от базы 497 одна ступень дала +266. (От слабой 8-средовой базы та же лестница давала лишь +172.)
 
-Кривые 0→15M: `a2c_training_final.png`; в ноутбуке ячейка «Achieved result» обновлена под рецепт-победитель (nenvs=16).
+Кривые 0→15M: `a2c_training_final.jpg`; в ноутбуке ячейка «Achieved result» обновлена под рецепт-победитель (nenvs=16).
 Оценка: 600+ = 20/20.
 
 Хронология 8-средовой линии (не пошла в сдачу, но доказала лестницу): 417 → 548 (+5M, рестарт 2.3e-4, entropy 0.005) → 589 (+3M, рестарт 1.2e-4) → продления дальше только ухудшали (533, 503) — потолок зрелой политики. Сид-лотерея на 8 средах: 373/378/439. Все чекпоинты целы на vm-shared (`runs/*.ckpt.pt`).
@@ -42,8 +42,14 @@
 
 - `a2c-optional-solved.ipynb` — готовый ноутбук со всеми `<YOUR CODE>` блоками. Для сдачи.
 - `solution.py` — те же 6 блоков одним модулем (модель, Policy, ComputeValueTargets, MergeTimeBatch, A2C).
-- `train.py` — скрипт обучения (то же, что финальная ячейка, но для запуска с CLI).
+- `train.py` — скрипт обучения (то же, что финальная ячейка, но для запуска с CLI): сам скачивает 3 helper-файла курса, патчит gymnasium 1.4, умеет `--resume auto`.
 - `test_targets.py` — юнит-тесты ComputeValueTargets и MergeTimeBatch с ручными расчётами.
+- `eval_ckpt.py` — прогон сохранённого чекпоинта в свежих средах (сырые награды, sample и argmax).
+- `n16s45.ckpt.pt` — финальный чекпоинт линии-победителя (16 сред, сид 45, 15M шагов).
+- `a2c_training_final.jpg` — кривые обучения 0→15M линии-победителя.
+
+Прогонные логи `runs/*.jsonl` и остальные чекпоинты (full1/full2, сиды 43/44/46)
+лежат на vm-shared, в репозиторий не входят.
 
 ## Как запустить полный прогон
 
@@ -54,17 +60,24 @@ gymnasium 1.4 (atari из ale-py вместо shimmy) и скачивает 3 he
 **Локально / ноут CPU (~6-8 ч):** python 3.10+, затем:
 
     pip install torch --index-url https://download.pytorch.org/whl/cpu
-    pip install "gymnasium[atari,accept-rom-license]" opencv-python-headless tensorboardX "shimmy[atari]==1.3.0"
+    pip install "gymnasium[atari,accept-rom-license]" opencv-python-headless tensorboardX
+
+На Apple Silicon добавьте `--device mps` (автовыбор при `--device auto`):
+полный рецепт 15M шагов — ~3 ч (замер на M3 Pro: ~1400 шагов/с против
+~670 на CPU; модельная часть ускоряется в ~6 раз, дальше узкое место — среды).
     python test_targets.py   # юнит-тесты должны пройти
     python train.py --nenvs 16 --total-steps 10000000 --out runs/run.jsonl
     # ступень 2 (победная): resume до 15M с LR-рестартом и сниженной энтропией
-    python train.py --nenvs 16 --total-steps 15000000 --entropy-coef 0.005 \
+    python train.py --nenvs 16 --total-steps 15000000 --entropy-coef 0.005 --lr 2.3e-4 \
         --out runs/run.jsonl --resume auto
 
-На python 3.12 shimmy 1.3 не ставится (нужен старый ale-py) — тогда в
-`atari_wrappers.py` заменить строку 10 `from shimmy.atari_env import AtariEnv`
-на try/except-блок с `from ale_py.env import AtariEnv` + `gym.register_envs(ale_py)`
-(в Colab-ячейке ноутбука патч уже вшит).
+`train.py` при первом запуске сам скачивает helper-файлы курса и патчит
+`atari_wrappers.py` под gymnasium 1.4 (atari из ale-py вместо shimmy), так что
+python 3.12 и свежий ale-py работают без ручных правок. Тот же патч вшит в
+setup-ячейку ноутбука для Colab.
+
+Оценка чекпоинта: `python eval_ckpt.py n16s45.ckpt.pt 3 2` (3 эпизода sample,
+2 — argmax, сырые награды).
 
 ## Скор
 

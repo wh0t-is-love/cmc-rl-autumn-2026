@@ -63,6 +63,7 @@ class Policy:
         done again inside A2C.loss where the graph is needed.
         """
         obs = torch.as_tensor(inputs, dtype=torch.float32)
+        obs = obs.to(next(self.model.parameters()).device)
         with torch.no_grad():
             logits, values = self.model(obs)
             dist = Categorical(logits=logits)
@@ -95,9 +96,10 @@ class ComputeValueTargets:
 
         # Bootstrap value of the last observation s_{t+T} for every env.
         last_obs = trajectory["state"]["latest_observation"]  # (N, 4, 84, 84)
+        device = next(self.policy.model.parameters()).device
         with torch.no_grad():
             _, last_values = self.policy.model(
-                torch.as_tensor(last_obs, dtype=torch.float32)
+                torch.as_tensor(last_obs, dtype=torch.float32).to(device)
             )
         acc = last_values.cpu().numpy().astype(np.float32).copy()  # (N,)
 
@@ -151,8 +153,9 @@ class A2C:
         The log_probs / values stored in the trajectory come from
         policy.act() under no_grad, so they carry no graph — recompute here.
         """
-        obs = torch.as_tensor(trajectory["observations"], dtype=torch.float32)
-        actions = torch.as_tensor(trajectory["actions"], dtype=torch.int64)
+        device = next(self.policy.model.parameters()).device
+        obs = torch.as_tensor(trajectory["observations"], dtype=torch.float32).to(device)
+        actions = torch.as_tensor(trajectory["actions"], dtype=torch.int64).to(device)
         logits, values = self.policy.model(obs)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)   # log π(a_t | s_t), with grads
@@ -163,13 +166,13 @@ class A2C:
         # Advantage: how much better the return turned out than predicted.
         # Detached: the value net is trained by value_loss only.
         advantages = (
-            torch.as_tensor(trajectory["value_targets"])
-            - torch.as_tensor(trajectory["values"])
+            torch.as_tensor(trajectory["value_targets"]).to(log_probs.device)
+            - torch.as_tensor(trajectory["values"]).to(log_probs.device)
         ).detach()
         return -(advantages * log_probs).mean()
 
     def value_loss(self, trajectory, values):
-        targets = torch.as_tensor(trajectory["value_targets"])
+        targets = torch.as_tensor(trajectory["value_targets"]).to(values.device)
         return 0.5 * ((values - targets) ** 2).mean()
 
     def loss(self, trajectory):
@@ -179,7 +182,7 @@ class A2C:
         loss = pl + self.value_loss_coef * vl - self.entropy_coef * entropy
         # metrics for logging (detached)
         with torch.no_grad():
-            targets = torch.as_tensor(trajectory["value_targets"])
+            targets = torch.as_tensor(trajectory["value_targets"]).to(values.device)
             ss_res = ((values - targets) ** 2).sum()
             ss_tot = ((targets - targets.mean()) ** 2).sum() + 1e-8
             self.last_metrics = {

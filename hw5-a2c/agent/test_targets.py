@@ -1,10 +1,11 @@
 """Hand-computed unit tests for ComputeValueTargets and MergeTimeBatch."""
+import os
 import sys
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/tmp/rl_hw/src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from solution import ComputeValueTargets, MergeTimeBatch, Policy  # noqa: E402
 
 
@@ -13,10 +14,14 @@ class DummyModel:
 
     def __init__(self, values):
         self.values = torch.as_tensor(values, dtype=torch.float32)
+        self._param = torch.nn.Parameter(torch.zeros(1))
 
     def __call__(self, obs):
         logits = torch.zeros((obs.shape[0], 6))
         return logits, self.values.clone()
+
+    def parameters(self):
+        return iter([self._param])
 
 
 class DummyPolicy(Policy):
